@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,12 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Attention
 from typing import Optional, Tuple, Union
 from .motion_gen_utils_dev import WanTimeEmbedding
 import time
+
+
+WAV2VEC2_MODEL_PATH = os.environ.get(
+    "DYSTREAM_WAV2VEC2_PATH",
+    "/root/autodl-tmp/hf_models/wav2vec2-base-960h",
+)
 
 
 class RoPEEncoding(nn.Module):
@@ -229,7 +236,7 @@ def make_attention_causal(attn: Wav2Vec2Attention):
 class WrapedWav2Vec(nn.Module):
     def __init__(self, layers: int = 1):
         super().__init__()
-        base = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+        base = Wav2Vec2Model.from_pretrained(WAV2VEC2_MODEL_PATH)
         self.feature_extractor = base.feature_extractor
         self.feature_projection = base.feature_projection
         self.encoder = base.encoder
@@ -351,7 +358,7 @@ class Audio2FaceGPT(nn.Module):
         self.cfg = cfg
         self.audio_encoder_face = WrapedWav2Vec(layers=self.cfg.wav2vec_layer)
         self.audio_encoder_face_other = WrapedWav2Vec(layers=self.cfg.wav2vec_layer)
-        self.audio_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+        self.audio_processor = Wav2Vec2Processor.from_pretrained(WAV2VEC2_MODEL_PATH)
         self.audio_dim = audio_dim
         self.face_dim = face_dim
         self.hidden_size = hidden_size

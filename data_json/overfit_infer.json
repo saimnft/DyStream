@@ -1,0 +1,34 @@
+[
+  {
+    "origin_video_path": null,
+    "resampled_video_path": "overfit_data/speaker_001/ref.png",
+    "ref_img_path": "overfit_data/speaker_001/ref.png",
+    "audio_path": "overfit_data/speaker_001/audio.wav",
+    "audio_self_path": "overfit_data/speaker_001/audio.wav",
+    "audio_other_path": null,
+    "motion_self_path": "overfit_data/speaker_001/motion.npz",
+    "motion_other_path": null,
+    "mode": "test_wild",
+    "dataset_type": "speaker_only",
+    "video_id": "speaker_001",
+    "frames": 279,
+    "start_idx": 0,
+    "end_idx": 96
+  },
+  {
+    "origin_video_path": null,
+    "resampled_video_path": "overfit_data/speaker_002/ref.png",
+    "ref_img_path": "overfit_data/speaker_002/ref.png",
+    "audio_path": "overfit_data/speaker_002/audio.wav",
+    "audio_self_path": "overfit_data/speaker_002/audio.wav",
+    "audio_other_path": null,
+    "motion_self_path": "overfit_data/speaker_002/motion.npz",
+    "motion_other_path": null,
+    "mode": "test_wild",
+    "dataset_type": "speaker_only",
+    "video_id": "speaker_002",
+    "frames": 263,
+    "start_idx": 0,
+    "end_idx": 96
+  }
+]

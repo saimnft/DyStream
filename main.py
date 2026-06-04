@@ -412,6 +412,9 @@ class MotionGenLightningModule(LightningModule):
 
     def _get_latent(self, test_file):
         current_path = os.getcwd()
+        ref_img_path = test_file.get("ref_img_path", None)
+        if ref_img_path is not None and os.path.exists(ref_img_path):
+            return ref_img_path
         if not os.path.exists(test_file["motion_self_path"]):
             ori_img_path = test_file["resampled_video_path"].replace(".mp4", ".png")
             masked_img_path = ori_img_path.replace(".png", "_masked.png")
