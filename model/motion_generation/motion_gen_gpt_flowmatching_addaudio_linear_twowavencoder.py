@@ -1,4 +1,6 @@
 import math
+import os
+import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +12,12 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Attention
 from typing import Optional, Tuple, Union
 from .motion_gen_utils_dev import WanTimeEmbedding
 import time
+
+
+WAV2VEC2_MODEL_PATH = os.environ.get(
+    "DYSTREAM_WAV2VEC2_PATH",
+    "/root/autodl-tmp/hf_models/wav2vec2-base-960h",
+)
 
 
 class RoPEEncoding(nn.Module):
@@ -198,7 +206,58 @@ class Audio2FaceGPTBlock(nn.Module):
         return x
 
 
-def make_attention_causal(attn: Wav2Vec2Attention):
+def _apply_rope_to_wav2vec_qk(x: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to q/k tensors shaped [B, H, T, D]."""
+    _, _, seq_len, head_dim = x.shape
+    if head_dim % 2 != 0:
+        return x
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim))
+    pos = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+    freqs = torch.einsum("t,d->td", pos, inv_freq)
+    cos = freqs.cos()[None, None, :, :].to(dtype=x.dtype)
+    sin = freqs.sin()[None, None, :, :].to(dtype=x.dtype)
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    x_rot = torch.empty_like(x)
+    x_rot[..., 0::2] = x_even * cos - x_odd * sin
+    x_rot[..., 1::2] = x_even * sin + x_odd * cos
+    return x_rot
+
+
+class ZeroWav2VecPosConv(nn.Module):
+    """Replacement for Wav2Vec2 conv positional embedding."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(hidden_states)
+
+
+def replace_wav2vec_groupnorm_with_layernorm(feature_extractor: nn.Module) -> None:
+    """Replace Wav2Vec2 first conv GroupNorm with per-time-step LayerNorm.
+
+    HF wav2vec2-base-960h normally uses GroupNorm on the first feature extractor
+    conv layer. For streaming experiments, this monkey-patches the conv layer to
+    normalize channels independently at each time step.
+    """
+    for layer in getattr(feature_extractor, "conv_layers", []):
+        layer_norm = getattr(layer, "layer_norm", None)
+        if isinstance(layer_norm, nn.GroupNorm):
+            out_channels = layer.conv.out_channels
+            layer.layer_norm = nn.LayerNorm(out_channels)
+
+            def forward_with_layernorm(self, hidden_states):
+                hidden_states = self.conv(hidden_states)
+                hidden_states = hidden_states.transpose(1, 2)
+                hidden_states = self.layer_norm(hidden_states)
+                hidden_states = hidden_states.transpose(1, 2)
+                hidden_states = self.activation(hidden_states)
+                return hidden_states
+
+            layer.forward = types.MethodType(forward_with_layernorm, layer)
+            print("[DyStream] Replaced Wav2Vec2 GroupNorm with per-step LayerNorm.")
+            return
+
+
+def make_attention_causal(attn: Wav2Vec2Attention, lookahead: Optional[int] = None, use_rope: bool = False):
     q_proj, k_proj, v_proj, out_proj = attn.q_proj, attn.k_proj, attn.v_proj, attn.out_proj
     n_head, head_dim, p = attn.num_heads, attn.head_dim, attn.dropout
 
@@ -213,10 +272,25 @@ def make_attention_causal(attn: Wav2Vec2Attention):
         q = q_proj(x).view(B, T, n_head, head_dim).transpose(1, 2)
         k = k_proj(x).view(B, T, n_head, head_dim).transpose(1, 2)
         v = v_proj(x).view(B, T, n_head, head_dim).transpose(1, 2)
+        if use_rope:
+            q = _apply_rope_to_wav2vec_qk(q)
+            k = _apply_rope_to_wav2vec_qk(k)
+
+        attn_mask = None
+        if lookahead is not None:
+            query_pos = torch.arange(T, device=x.device).unsqueeze(1)
+            key_pos = torch.arange(T, device=x.device).unsqueeze(0)
+            allowed = key_pos <= query_pos + int(lookahead)
+            attn_mask = torch.zeros((T, T), device=x.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(~allowed, torch.finfo(q.dtype).min)
+        if attention_mask is not None:
+            attn_mask = attention_mask if attn_mask is None else attention_mask + attn_mask
+
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
+            attn_mask=attn_mask,
             dropout_p=p if self.training else 0.0,
             is_causal=False,
         )
@@ -229,13 +303,33 @@ def make_attention_causal(attn: Wav2Vec2Attention):
 class WrapedWav2Vec(nn.Module):
     def __init__(self, layers: int = 1):
         super().__init__()
-        base = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+        base = Wav2Vec2Model.from_pretrained(WAV2VEC2_MODEL_PATH)
+        self.experimental_causal = os.environ.get("DYSTREAM_EXPERIMENTAL_CAUSAL_WAV2VEC2", "0") == "1"
+        self.lookahead = int(os.environ.get("DYSTREAM_WAV2VEC2_LOOKAHEAD", "0"))
+        self.use_rope = os.environ.get("DYSTREAM_WAV2VEC2_ROPE", "1") == "1"
+        self.replace_groupnorm = os.environ.get("DYSTREAM_WAV2VEC2_LAYERNORM", "1") == "1"
+        self.remove_pos_conv = os.environ.get("DYSTREAM_WAV2VEC2_REMOVE_POS_CONV", "1") == "1"
+
         self.feature_extractor = base.feature_extractor
         self.feature_projection = base.feature_projection
         self.encoder = base.encoder
         self.encoder.layers = self.encoder.layers[:layers]
-        for l in self.encoder.layers:
-            make_attention_causal(l.attention)
+
+        if self.experimental_causal:
+            if self.replace_groupnorm:
+                replace_wav2vec_groupnorm_with_layernorm(self.feature_extractor)
+            if self.remove_pos_conv and hasattr(self.encoder, "pos_conv_embed"):
+                self.encoder.pos_conv_embed = ZeroWav2VecPosConv()
+                print("[DyStream] Removed Wav2Vec2 convolutional positional embedding.")
+            print(
+                "[DyStream] Using experimental limited-lookahead Wav2Vec2 "
+                f"attention: lookahead={self.lookahead}, rope={self.use_rope}"
+            )
+            for l in self.encoder.layers:
+                make_attention_causal(l.attention, lookahead=self.lookahead, use_rope=self.use_rope)
+        else:
+            for l in self.encoder.layers:
+                make_attention_causal(l.attention, lookahead=None, use_rope=False)
 
     def forward(
         self,
@@ -351,7 +445,7 @@ class Audio2FaceGPT(nn.Module):
         self.cfg = cfg
         self.audio_encoder_face = WrapedWav2Vec(layers=self.cfg.wav2vec_layer)
         self.audio_encoder_face_other = WrapedWav2Vec(layers=self.cfg.wav2vec_layer)
-        self.audio_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+        self.audio_processor = Wav2Vec2Processor.from_pretrained(WAV2VEC2_MODEL_PATH)
         self.audio_dim = audio_dim
         self.face_dim = face_dim
         self.hidden_size = hidden_size
@@ -399,6 +493,7 @@ class Audio2FaceGPT(nn.Module):
         self.cfg_anchor = cfg.cfg_anchor
         self.drop_anchor = cfg.drop_anchor
         self.cfg_audio_anchor = cfg.cfg_audio_anchor
+        self.guidance_mode = os.environ.get("DYSTREAM_GUIDANCE_MODE", "full")
 
     def generate_causal_mask(self, seq_len, device):
         mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
@@ -507,21 +602,24 @@ class Audio2FaceGPT(nn.Module):
         past_audio_other=None,
         noise_scheduler=None,
         num_inference_steps=10,
+        guidance_mode=None,
     ):
-        use_pre_compute_audio_feature = True
+        use_pre_compute_audio_feature = per_compute_audio_feature is not None
         audio = audio_self
         n = gen_frames + self.inpainting_length + 1
-        audio2face_fea = self.get_audio2face_fea(audio_self, past_audio_self, n)
-        audio2face_fea_other = self.get_audio2face_fea_other(audio_other, past_audio_other, n)
-        device = audio.device
-        if noise_scheduler is not None:
-            noise_scheduler.set_timesteps(num_inference_steps, device=device)
-            timesteps = noise_scheduler.timesteps
-        audio_features = audio2face_fea
-        audio_other_features = audio2face_fea_other
         if use_pre_compute_audio_feature:
             audio_features = per_compute_audio_feature
             audio_other_features = per_compute_audio_other_feature
+            device = audio_features.device
+        else:
+            audio2face_fea = self.get_audio2face_fea(audio_self, past_audio_self, n)
+            audio2face_fea_other = self.get_audio2face_fea_other(audio_other, past_audio_other, n)
+            audio_features = audio2face_fea
+            audio_other_features = audio2face_fea_other
+            device = audio.device
+        if noise_scheduler is not None:
+            noise_scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = noise_scheduler.timesteps
         audio_features = audio_features[:, 1:]
         audio_other_features = audio_other_features[:, 1:]
         bs, seq_len, _ = audio_features.shape
@@ -538,30 +636,57 @@ class Audio2FaceGPT(nn.Module):
         face_hidden_last = self.face_embed(past_motion)
         face_hidden = torch.zeros(bs, seq_len, self.hidden_size, device=device)
         face_hidden[:, :self.inpainting_length] = face_hidden_last
+        guidance_mode = guidance_mode or getattr(self, "guidance_mode", "full")
+        if guidance_mode not in {"full", "uncond_all", "all_only"}:
+            raise ValueError(f"Unsupported guidance_mode: {guidance_mode}")
         face_outputs = []
         for t in range(self.inpainting_length, seq_len):
-            x = face_hidden[:, :t]
-            x = torch.cat([x] * 5, dim=0)
-            audio_hidden_input = torch.cat(
-                [
-                    audio_hidden_0[:, :t],
-                    audio_hidden_0[:, :t],
-                    audio_hidden_1[:, :t],
-                    audio_hidden_2[:, :t],
-                    audio_hidden_3[:, :t],
-                ],
-                dim=0,
-            )
-            anchor_hidden_input = torch.cat(
-                [
-                    anchor_hidden * 0,
-                    anchor_hidden * 1,
-                    anchor_hidden * 0,
-                    anchor_hidden * 0,
-                    anchor_hidden * 1,
-                ],
-                dim=0,
-            )
+            x_base = face_hidden[:, :t]
+            if guidance_mode == "all_only":
+                x = x_base
+                audio_hidden_input = audio_hidden_3[:, :t]
+                anchor_hidden_input = anchor_hidden
+                num_conditions = 1
+            elif guidance_mode == "uncond_all":
+                x = torch.cat([x_base] * 2, dim=0)
+                audio_hidden_input = torch.cat(
+                    [
+                        audio_hidden_0[:, :t],
+                        audio_hidden_3[:, :t],
+                    ],
+                    dim=0,
+                )
+                anchor_hidden_input = torch.cat(
+                    [
+                        anchor_hidden * 0,
+                        anchor_hidden * 1,
+                    ],
+                    dim=0,
+                )
+                num_conditions = 2
+            else:
+                x = torch.cat([x_base] * 5, dim=0)
+                audio_hidden_input = torch.cat(
+                    [
+                        audio_hidden_0[:, :t],
+                        audio_hidden_0[:, :t],
+                        audio_hidden_1[:, :t],
+                        audio_hidden_2[:, :t],
+                        audio_hidden_3[:, :t],
+                    ],
+                    dim=0,
+                )
+                anchor_hidden_input = torch.cat(
+                    [
+                        anchor_hidden * 0,
+                        anchor_hidden * 1,
+                        anchor_hidden * 0,
+                        anchor_hidden * 0,
+                        anchor_hidden * 1,
+                    ],
+                    dim=0,
+                )
+                num_conditions = 5
             for block in self.blocks:
                 x = block(
                     x,
@@ -574,23 +699,36 @@ class Audio2FaceGPT(nn.Module):
             gpt_output_t = self.output_proj(x_t)
             if noise_scheduler is not None:
                 latent_t = torch.randn_like(gpt_output_t[:bs])
+                # The diffusers scheduler keeps an internal step index. When
+                # one_clip_only_inference generates multiple frames in one call,
+                # each frame must start a fresh denoising trajectory.
+                if hasattr(noise_scheduler, "_step_index"):
+                    noise_scheduler._step_index = None
                 for i, timestep in enumerate(timesteps):
                     t_batch = torch.full((bs,), timestep, device=device, dtype=torch.long)
-                    latent_model_input = latent_t
+                    latent_model_input = latent_t if num_conditions == 1 else latent_t.repeat(num_conditions, 1, 1)
                     time_embedding = self.time_embed(t_batch).unsqueeze(1)
+                    if num_conditions > 1:
+                        time_embedding = time_embedding.repeat(num_conditions, 1, 1)
                     output_batch = self.diffusion_head(
                         latent_model_input,
                         gpt_output_t,
                         temb=time_embedding,
                     )
-                    noise_pred_uncond, noise_pred_cond_anchor, noise_pred_cond_audio, noise_pred_cond_audio_other, noise_pred_cond_all = output_batch.chunk(5, dim=0)
-                    noise_pred = (
-                        noise_pred_uncond
-                        + self.cfg_audio * (noise_pred_cond_audio - noise_pred_uncond)
-                        + self.cfg_audio_other * (noise_pred_cond_audio_other - noise_pred_uncond)
-                        + self.cfg_anchor * (noise_pred_cond_anchor - noise_pred_uncond)
-                        + self.cfg_all * (noise_pred_cond_all - noise_pred_uncond)
-                    )
+                    if guidance_mode == "all_only":
+                        noise_pred = output_batch
+                    elif guidance_mode == "uncond_all":
+                        noise_pred_uncond, noise_pred_cond_all = output_batch.chunk(2, dim=0)
+                        noise_pred = noise_pred_uncond + self.cfg_all * (noise_pred_cond_all - noise_pred_uncond)
+                    else:
+                        noise_pred_uncond, noise_pred_cond_anchor, noise_pred_cond_audio, noise_pred_cond_audio_other, noise_pred_cond_all = output_batch.chunk(5, dim=0)
+                        noise_pred = (
+                            noise_pred_uncond
+                            + self.cfg_audio * (noise_pred_cond_audio - noise_pred_uncond)
+                            + self.cfg_audio_other * (noise_pred_cond_audio_other - noise_pred_uncond)
+                            + self.cfg_anchor * (noise_pred_cond_anchor - noise_pred_uncond)
+                            + self.cfg_all * (noise_pred_cond_all - noise_pred_uncond)
+                        )
                     sigma_idx = noise_scheduler.step_index
                     if sigma_idx is None:
                         noise_scheduler._init_step_index(timestep)
