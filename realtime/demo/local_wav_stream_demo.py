@@ -207,8 +207,25 @@ def main():
             )
             if args.profile and args.engine == "stateful":
                 p = engine.profile_totals
+                s = engine.last_step_profile
+                model_stage = s["audio"] + s["motion"]
+                render_stage = s["render"]
+                if model_stage >= render_stage:
+                    bottleneck = "audio+motion"
+                    bottleneck_time = model_stage
+                else:
+                    bottleneck = "render"
+                    bottleneck_time = render_stage
                 print(
-                    f"[profile] audio={p['audio']:.3f}s, motion={p['motion']:.3f}s, "
+                    f"[profile-step] audio={s['audio']:.3f}s, motion={s['motion']:.3f}s, "
+                    f"audio+motion={model_stage:.3f}s, render={render_stage:.3f}s, "
+                    f"render_wait={s['render_wait']:.3f}s, step_wall={s['step']:.3f}s, "
+                    f"batches={s['batches']}, gen_frames={s['generated_frames']}, "
+                    f"ret_frames={s['returned_frames']}, bottleneck={bottleneck}:{bottleneck_time:.3f}s",
+                    flush=True,
+                )
+                print(
+                    f"[profile-total] audio={p['audio']:.3f}s, motion={p['motion']:.3f}s, "
                     f"render={p['render']:.3f}s, step_total={p['step']:.3f}s",
                     flush=True,
                 )

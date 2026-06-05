@@ -72,7 +72,7 @@ class StatefulStreamDyStreamEngine:
         self.render_frame_stride = max(1, int(render_frame_stride))
         self.async_render = bool(async_render and self.render_mode != "none")
         self._render_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1) if self.async_render else None
-        self._pending_render_future: Optional[Future[List[np.ndarray]]] = None
+        self._pending_render_future: Optional[Future[tuple[List[np.ndarray], float]]] = None
         self.use_ema = bool(use_ema)
         self.amp_audio = bool(amp or amp_audio)
         self.amp_motion = bool(amp or amp_motion)
@@ -88,6 +88,7 @@ class StatefulStreamDyStreamEngine:
             "render": 0.0,
             "step": 0.0,
         }
+        self.last_step_profile = self._new_step_profile()
 
         print("[StatefulStream] Loading DyStream and visualization models...")
         dystream_app.load_dystream_model()
@@ -143,15 +144,34 @@ class StatefulStreamDyStreamEngine:
             f"profile={self.profile}"
         )
 
+    def _new_step_profile(self) -> dict:
+        return {
+            "audio": 0.0,
+            "motion": 0.0,
+            "render": 0.0,
+            "render_wait": 0.0,
+            "step": 0.0,
+            "batches": 0,
+            "generated_frames": 0,
+            "returned_frames": 0,
+        }
+
+    def _step_profile_add(self, key: str, value: float) -> None:
+        if key in self.last_step_profile:
+            self.last_step_profile[key] += value
+
     def _sync_if_profile(self) -> None:
         if self.profile and torch.cuda.is_available() and str(self.device).startswith("cuda"):
             torch.cuda.synchronize()
 
-    def _profile_add(self, key: str, start_time: float) -> None:
+    def _profile_add(self, key: str, start_time: float) -> float:
         if not self.profile:
-            return
+            return 0.0
         self._sync_if_profile()
-        self.profile_totals[key] += time.perf_counter() - start_time
+        duration = time.perf_counter() - start_time
+        self.profile_totals[key] += duration
+        self._step_profile_add(key, duration)
+        return duration
 
     def _autocast_context(self, module: str):
         enabled = {
@@ -260,6 +280,7 @@ class StatefulStreamDyStreamEngine:
         available_feature_frames = max(0, target_audio_frames + self.prefix_frames)
 
         frames = []
+        self.last_step_profile = self._new_step_profile()
         self._sync_if_profile()
         step_start = time.perf_counter()
         while self.generated_frames < max_generatable:
@@ -270,10 +291,13 @@ class StatefulStreamDyStreamEngine:
                 break
 
             motion = self._generate_motion_batch(batch_frames)
+            self.last_step_profile["batches"] += 1
+            self.last_step_profile["generated_frames"] += int(motion.shape[1])
             self.past_motion = torch.cat([self.past_motion, motion], dim=1)[:, -self.prefix_frames :, :]
             self.generated_frames += motion.shape[1]
             if self.render_mode != "none":
                 frames.extend(self._render_motion_frames_pipelined(motion))
+        self.last_step_profile["returned_frames"] = len(frames)
         self._profile_add("step", step_start)
         return frames
 
@@ -412,10 +436,20 @@ class StatefulStreamDyStreamEngine:
     def _generate_next_motion(self) -> torch.Tensor:
         return self._generate_motion_batch(1)
 
-    def _render_motion_frames_profiled(self, motion_latents: torch.Tensor) -> List[np.ndarray]:
+    def _render_motion_frames_timed(self, motion_latents: torch.Tensor) -> tuple[List[np.ndarray], float]:
+        self._sync_if_profile()
         render_start = time.perf_counter()
         frames = self._render_motion_frames(motion_latents)
-        self._profile_add("render", render_start)
+        if self.profile:
+            self._sync_if_profile()
+        duration = time.perf_counter() - render_start
+        if self.profile:
+            self.profile_totals["render"] += duration
+        return frames, duration
+
+    def _render_motion_frames_profiled(self, motion_latents: torch.Tensor) -> List[np.ndarray]:
+        frames, duration = self._render_motion_frames_timed(motion_latents)
+        self._step_profile_add("render", duration)
         return frames
 
     def _render_motion_frames_pipelined(self, motion_latents: torch.Tensor) -> List[np.ndarray]:
@@ -429,9 +463,15 @@ class StatefulStreamDyStreamEngine:
             return self._render_motion_frames_profiled(motion_latents)
 
         previous_future = self._pending_render_future
-        completed = previous_future.result() if previous_future is not None else []
+        if previous_future is not None:
+            wait_start = time.perf_counter()
+            completed, previous_render_duration = previous_future.result()
+            self._step_profile_add("render_wait", time.perf_counter() - wait_start)
+            self._step_profile_add("render", previous_render_duration)
+        else:
+            completed = []
         self._pending_render_future = self._render_executor.submit(
-            self._render_motion_frames_profiled,
+            self._render_motion_frames_timed,
             motion_latents.detach(),
         )
         return completed
@@ -440,7 +480,7 @@ class StatefulStreamDyStreamEngine:
         """Return any frames still pending in the async render worker."""
         if self._pending_render_future is None:
             return []
-        frames = self._pending_render_future.result()
+        frames, _ = self._pending_render_future.result()
         self._pending_render_future = None
         return frames
 
