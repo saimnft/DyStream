@@ -70,6 +70,11 @@ def parse_args():
         default=1,
         help="Render every Nth frame and duplicate it for skipped frames. Higher is faster but more stuttery.",
     )
+    parser.add_argument(
+        "--async-render",
+        action="store_true",
+        help="Pipeline rendering one chunk behind motion generation. Adds about one chunk of output latency but may improve wall-clock throughput.",
+    )
     parser.add_argument("--no-ema", action="store_true", help="Skip EMA weight swapping during streaming inference for speed benchmarking.")
     parser.add_argument("--amp", action="store_true", help="Use CUDA autocast for audio/motion/render inference.")
     parser.add_argument("--amp-audio", action="store_true", help="Use CUDA autocast only for Wav2Vec2 audio feature extraction.")
@@ -158,6 +163,7 @@ def main():
         engine_kwargs["guidance_mode"] = args.guidance_mode
         engine_kwargs["render_mode"] = args.render_mode
         engine_kwargs["render_frame_stride"] = args.render_frame_stride
+        engine_kwargs["async_render"] = args.async_render
         engine_kwargs["use_ema"] = not args.no_ema
         engine_kwargs["amp"] = args.amp
         engine_kwargs["amp_audio"] = args.amp_audio
@@ -213,6 +219,21 @@ def main():
     except KeyboardInterrupt:
         print("[Demo] Interrupted by user.")
     finally:
+        if args.engine == "stateful" and hasattr(engine, "flush"):
+            frames = engine.flush()
+            for frame in frames:
+                if writer is not None:
+                    writer.append_data(frame)
+                total_frames += 1
+
+                if args.display:
+                    cv2.imshow("DyStream pseudo-stream", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+            if frames:
+                print(f"[Demo] Flushed async render frames: {len(frames)}", flush=True)
+        if hasattr(engine, "close"):
+            engine.close()
         if writer is not None:
             writer.close()
         if args.display:

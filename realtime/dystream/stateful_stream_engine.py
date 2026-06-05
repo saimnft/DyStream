@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional
@@ -50,6 +51,7 @@ class StatefulStreamDyStreamEngine:
         guidance_mode: str = "full",
         render_mode: str = "per_frame",
         render_frame_stride: int = 1,
+        async_render: bool = False,
         use_ema: bool = True,
         amp: bool = False,
         amp_audio: bool = False,
@@ -68,6 +70,9 @@ class StatefulStreamDyStreamEngine:
         if self.render_mode not in {"per_frame", "batch", "none"}:
             raise ValueError(f"Unsupported render_mode: {self.render_mode}")
         self.render_frame_stride = max(1, int(render_frame_stride))
+        self.async_render = bool(async_render and self.render_mode != "none")
+        self._render_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1) if self.async_render else None
+        self._pending_render_future: Optional[Future[List[np.ndarray]]] = None
         self.use_ema = bool(use_ema)
         self.amp_audio = bool(amp or amp_audio)
         self.amp_motion = bool(amp or amp_motion)
@@ -131,6 +136,7 @@ class StatefulStreamDyStreamEngine:
             f"encode_listener_audio={self.encode_listener_audio}, "
             f"guidance_mode={self.guidance_mode}, "
             f"render_mode={self.render_mode}, render_frame_stride={self.render_frame_stride}, "
+            f"async_render={self.async_render}, "
             f"use_ema={self.use_ema}, amp_audio={self.amp_audio}, "
             f"amp_motion={self.amp_motion}, amp_render={self.amp_render}, "
             f"amp_dtype={self.amp_dtype}, "
@@ -159,6 +165,9 @@ class StatefulStreamDyStreamEngine:
         return torch.autocast(device_type="cuda", dtype=dtype)
 
     def reset_stream_state(self) -> None:
+        if getattr(self, "_pending_render_future", None) is not None:
+            self._pending_render_future.result()
+            self._pending_render_future = None
         self.audio_buffer = np.zeros((0,), dtype=np.float32)
         self.audio_other_buffer = np.zeros((0,), dtype=np.float32)
         self.generated_frames = 0
@@ -264,9 +273,7 @@ class StatefulStreamDyStreamEngine:
             self.past_motion = torch.cat([self.past_motion, motion], dim=1)[:, -self.prefix_frames :, :]
             self.generated_frames += motion.shape[1]
             if self.render_mode != "none":
-                render_start = time.perf_counter()
-                frames.extend(self._render_motion_frames(motion))
-                self._profile_add("render", render_start)
+                frames.extend(self._render_motion_frames_pipelined(motion))
         self._profile_add("step", step_start)
         return frames
 
@@ -404,6 +411,44 @@ class StatefulStreamDyStreamEngine:
     @torch.no_grad()
     def _generate_next_motion(self) -> torch.Tensor:
         return self._generate_motion_batch(1)
+
+    def _render_motion_frames_profiled(self, motion_latents: torch.Tensor) -> List[np.ndarray]:
+        render_start = time.perf_counter()
+        frames = self._render_motion_frames(motion_latents)
+        self._profile_add("render", render_start)
+        return frames
+
+    def _render_motion_frames_pipelined(self, motion_latents: torch.Tensor) -> List[np.ndarray]:
+        """Render with one-chunk delay so previous render can overlap current motion.
+
+        In async mode, each call returns the previous render result and submits
+        the current motion latents to a single render worker. Call flush() after
+        the last audio chunk to retrieve the final submitted render.
+        """
+        if not self.async_render:
+            return self._render_motion_frames_profiled(motion_latents)
+
+        previous_future = self._pending_render_future
+        completed = previous_future.result() if previous_future is not None else []
+        self._pending_render_future = self._render_executor.submit(
+            self._render_motion_frames_profiled,
+            motion_latents.detach(),
+        )
+        return completed
+
+    def flush(self) -> List[np.ndarray]:
+        """Return any frames still pending in the async render worker."""
+        if self._pending_render_future is None:
+            return []
+        frames = self._pending_render_future.result()
+        self._pending_render_future = None
+        return frames
+
+    def close(self) -> None:
+        self.flush()
+        if self._render_executor is not None:
+            self._render_executor.shutdown(wait=True)
+            self._render_executor = None
 
     @torch.no_grad()
     def _render_motion_frames(self, motion_latents: torch.Tensor) -> List[np.ndarray]:
