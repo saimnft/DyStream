@@ -2,3 +2,6 @@
 outputs*
 checkpoints*
 tools*
+.env
+.env.*
+!.env.example
