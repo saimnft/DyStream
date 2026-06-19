@@ -49,6 +49,17 @@ Run the demo with a single command:
 bash run.sh
 ```
 
+## Experimental Realtime Demo
+
+An experimental realtime Qwen-Omni + DyStream session demo is provided under `realtime/` for assessment and development purposes.
+
+```bash
+source .env
+bash run_qwen_omni_dystream_session_stream.sh
+```
+
+See `realtime/README.md` for details.
+
 ## Batch Inference with Custom Data
 
 ### Configuration

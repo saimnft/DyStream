@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import cv2
-import librosa
 import numpy as np
 
 try:
@@ -36,16 +35,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from realtime.demo.qwen_omni_browser_voice_demo import _iter_dashscope_omni_chunks  # noqa: E402
-from realtime.demo.qwen_omni_dystream_dialogue_demo import (  # noqa: E402
-    build_engine,
+from realtime.engine_utils import build_engine  # noqa: E402
+from realtime.media_utils import (  # noqa: E402
     encode_jpeg_rgb,
     float32_to_pcm16_bytes,
     float32_to_wav_bytes,
     mux_video_audio,
     pcm16_silence_bytes,
+    resample_float32,
     save_pcm16_wav,
 )
+from realtime.omni_client import iter_dashscope_omni_chunks  # noqa: E402
 from realtime.dystream.stateful_stream_engine import StatefulStreamDyStreamEngine  # noqa: E402
 
 
@@ -267,14 +267,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resample_float32(audio: np.ndarray, orig_sr: int, target_sr: int = 24000) -> np.ndarray:
-    audio = np.asarray(audio, dtype=np.float32)
-    if int(orig_sr) == int(target_sr):
-        return audio
-    return librosa.resample(audio, orig_sr=int(orig_sr), target_sr=int(target_sr)).astype(np.float32)
-
-
-def build_app(args: argparse.Namespace) -> FastAPI:
+def build_app(args: argparse.Namespace) -> FastAPI: 
     app = FastAPI()
 
     @app.get("/")
@@ -328,7 +321,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             print(f"[QwenOmniDyStreamSessionTiming] turn={turn_id} {event}=+{t:.3f}s")
             await ws.send_json({"type": "timing_event", "turn_id": turn_id, "event": event, "elapsed_s": t})
 
-        def build_turn_prompt(prompt: str) -> str:
+        def build_turn_prompt(prompt: str) -> str: # 存储历史回答，提供给后续轮次参考
             prompt = prompt or "Please answer with one short natural sentence. Use the same language as the user unless explicitly requested otherwise."
             recent_history = assistant_history[-max(0, int(args.max_history_turns)):]
             if not recent_history:
@@ -342,7 +335,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 f"Current turn instruction: {prompt}"
             )
 
-        def open_video_writer_if_needed(frame: np.ndarray) -> None:
+        def open_video_writer_if_needed(frame: np.ndarray) -> None: # 打开MP4 writer
             nonlocal video_writer, video_backend
             if video_writer is not None:
                 return
@@ -378,6 +371,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             print(f"[QwenOmniDyStreamSessionStream] video saved: {video_path} frames={saved_video_frames}")
             video_writer = None
 
+        # 处理生成帧：保存视频、发送预览、统计数据
         async def handle_frames(frames: list[np.ndarray] | tuple[np.ndarray, ...], source: str, turn_id: int = 0) -> int:
             nonlocal saved_video_frames, sent_frames, rendered_frames_seen
             preview_frames = 0
@@ -545,7 +539,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
                 def run_omni_worker() -> None:
                     try:
-                        for omni_chunk in _iter_dashscope_omni_chunks(
+                        for omni_chunk in iter_dashscope_omni_chunks(
                             api_key=api_key,
                             model=args.model,
                             wav_bytes=wav_bytes,
